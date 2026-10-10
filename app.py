@@ -21,12 +21,40 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # ==========================================
-# FUNÇÕES DE BANCO DE DADOS
+# FUNÇÕES DE BANCO DE DADOS E ESTADO
 # ==========================================
 ARQUIVO_TRATADOS = 'clientes_tratados.csv'
 ARQUIVO_OCULTOS = 'pppoes_ocultos.csv'
+ARQUIVO_BANCO = 'banco_dados_radius.csv'
 
-# --- Funções para Visitas (Operacional) ---
+# --- 1. Funções do Banco de Dados Principal ---
+def carregar_banco():
+    if os.path.exists(ARQUIVO_BANCO):
+        try:
+            df = pd.read_csv(ARQUIVO_BANCO)
+            df['Data_do_Log'] = pd.to_datetime(df['Data_do_Log']).dt.date
+            return df
+        except:
+            pass
+    return pd.DataFrame()
+
+def salvar_no_banco(novos_dados_df):
+    if novos_dados_df.empty:
+        return
+    # Primeiro agrupa os novos arquivos (caso tenham várias linhas do mesmo usuário no mesmo dia)
+    novos_agrupados = novos_dados_df.groupby(['username', 'Data_do_Log'], as_index=False)['c_username'].sum()
+    
+    df_atual = carregar_banco()
+    if not df_atual.empty:
+        df_combinado = pd.concat([df_atual, novos_agrupados])
+        # Remove logs duplicados (se subir a planilha do mesmo dia duas vezes, mantém a mais recente)
+        df_combinado = df_combinado.drop_duplicates(subset=['username', 'Data_do_Log'], keep='last')
+    else:
+        df_combinado = novos_agrupados
+    
+    df_combinado.to_csv(ARQUIVO_BANCO, index=False)
+
+# --- 2. Funções para Visitas (Operacional) ---
 def carregar_tratados():
     if os.path.exists(ARQUIVO_TRATADOS):
         try:
@@ -52,7 +80,7 @@ def limpar_tratados(username_remover):
     df = df[df['username'] != username_remover]
     df.to_csv(ARQUIVO_TRATADOS, index=False)
 
-# --- Funções para PPPoEs Ocultos ---
+# --- 3. Funções para PPPoEs Ocultos ---
 def carregar_ocultos():
     if os.path.exists(ARQUIVO_OCULTOS):
         try:
@@ -99,9 +127,7 @@ dias_necessarios = st.sidebar.number_input("Dias necessários com essa meta:", m
 
 st.sidebar.markdown("---")
 
-# ==========================================
-# NOVO: CONTROLE DE PPPoEs OCULTOS
-# ==========================================
+# CONTROLE DE PPPoEs OCULTOS
 st.sidebar.subheader("👁️ Ocultar PPPoEs")
 st.sidebar.caption("Ignorar PPPoEs do sistema (ex: default)")
 
@@ -124,9 +150,7 @@ if lista_pppoes_ocultos:
 
 st.sidebar.markdown("---")
 
-# ==========================================
 # CONTROLE OPERACIONAL (VISITAS)
-# ==========================================
 st.sidebar.subheader("🛠️ Controle Operacional")
 st.sidebar.caption("Gerenciar Status da Visita")
 
@@ -150,167 +174,195 @@ if not df_tratados.empty:
         st.rerun()
 
 # ==========================================
-# TELA PRINCIPAL
+# TELA PRINCIPAL E PROCESSAMENTO
 # ==========================================
 st.title("Painel Analítico - RADIUS Preventivo")
 st.markdown("Monitoramento inteligente de instabilidade de conexão")
 
-aba_relatorio, aba_dados = st.tabs(["📊 Relatório Consolidado", "📁 Importar Dados"])
+aba_relatorio, aba_dados = st.tabs(["📊 Relatório Consolidado", "📁 Banco de Dados (Importar)"])
 
 with aba_dados:
-    st.info("Suba os arquivos diários do RADIUS aqui para atualizar o Dashboard.")
+    st.info("Suba os arquivos diários do RADIUS aqui. Eles serão adicionados ao Banco de Dados e não sumirão ao atualizar a página.")
     arquivos_upload = st.file_uploader("Arraste as planilhas (Excel ou CSV):", type=["csv", "xlsx"], accept_multiple_files=True)
-
-if arquivos_upload:
-    lista_dfs = []
     
-    for arquivo in arquivos_upload:
-        try:
-            df = pd.read_excel(arquivo)
-        except:
-            try:
-                df = pd.read_csv(arquivo)
-            except:
-                df = pd.read_csv(arquivo, sep=';')
-                
-        df.columns = df.columns.str.lower()
-        
-        if 'username' in df.columns and 'c_username' in df.columns:
-            match_data = re.search(r'\d{2}-\d{2}-\d{4}|\d{4}-\d{2}-\d{2}', arquivo.name)
-            if match_data:
-                data_str = match_data.group()
+    if st.button("Salvar no Banco de Dados", type="primary"):
+        if arquivos_upload:
+            lista_dfs = []
+            for arquivo in arquivos_upload:
                 try:
-                    if data_str.startswith('20'): 
-                        data_formatada = pd.to_datetime(data_str, format='%Y-%m-%d').date()
-                    else: 
-                        data_formatada = pd.to_datetime(data_str, format='%d-%m-%Y').date()
+                    df = pd.read_excel(arquivo)
                 except:
-                    data_formatada = None 
-            else:
-                data_formatada = None
-            
-            if data_formatada and data_formatada <= data_corte:
-                df['Data_do_Log'] = data_formatada
-                lista_dfs.append(df)
-
-    if lista_dfs:
-        df_bruto = pd.concat(lista_dfs, ignore_index=True)
-        
-        # =========================================================
-        # A MÁGICA DA EXCLUSÃO ACONTECE AQUI
-        # =========================================================
-        # Remove completamente os PPPoEs da lista de ocultos antes de qualquer cálculo
-        lista_ocultos_ativos = carregar_ocultos()
-        df_bruto = df_bruto[~df_bruto['username'].isin(lista_ocultos_ativos)]
-        
-        # Agrupamento diário
-        df_diario = df_bruto.groupby(['username', 'Data_do_Log'], as_index=False)['c_username'].sum()
-        
-        if df_diario.empty:
-            st.warning("⚠️ Não há dados a exibir após os filtros (ou não há logs até a data de corte).")
-        else:
-            df_resumo = df_diario.groupby('username').agg(
-                Total_Desconexoes=('c_username', 'sum'),
-                Dias_com_Evento=('Data_do_Log', 'nunique'),
-                Pico_Logs_Diario=('c_username', 'max') 
-            ).reset_index()
-
-            # Inteligência do Alerta Crítico
-            datas_janela = [(data_corte - timedelta(days=i)) for i in range(janela_dias)]
-            df_janela = df_diario[df_diario['Data_do_Log'].isin(datas_janela)]
-            
-            df_janela_critico = df_janela[df_janela['c_username'] >= logs_critico]
-            contagem_critica = df_janela_critico.groupby('username')['Data_do_Log'].nunique().reset_index()
-            contagem_critica.rename(columns={'Data_do_Log': 'Qtd_Dias_Alerta'}, inplace=True)
-
-            df_resumo = pd.merge(df_resumo, contagem_critica, on='username', how='left')
-            df_resumo['Qtd_Dias_Alerta'] = df_resumo['Qtd_Dias_Alerta'].fillna(0)
-            df_resumo['🔥 Alerta Crítico'] = df_resumo['Qtd_Dias_Alerta'].apply(lambda x: "Sim" if x >= dias_necessarios else "Não")
-            
-            # Matriz Rápida para Registros Diários
-            datas_exibicao = sorted(datas_janela) 
-            df_pivot = df_diario.pivot(index='username', columns='Data_do_Log', values='c_username').fillna(0)
-            
-            registros_list = []
-            for cliente in df_resumo['username']:
-                historico = []
-                if cliente in df_pivot.index:
-                    for dia_alvo in datas_exibicao:
-                        qtd = int(df_pivot.at[cliente, dia_alvo]) if dia_alvo in df_pivot.columns else 0
-                        dia_str = dia_alvo.strftime("%d/%m")
-                        if qtd >= logs_critico:
-                            historico.append(f"{dia_str}: 🔴 {qtd}")
-                        else:
-                            historico.append(f"{dia_str}: 🟢 {qtd}")
-                registros_list.append(' | '.join(historico))
+                    try:
+                        df = pd.read_csv(arquivo)
+                    except:
+                        df = pd.read_csv(arquivo, sep=';')
+                        
+                df.columns = df.columns.str.lower()
                 
-            df_resumo['Registros_Diários'] = registros_list
-            df_final = df_resumo.copy()
-            
-            # Definição do Status Base
-            def definir_status(row):
-                if row['Pico_Logs_Diario'] >= limite_elegivel:
-                    return '🔴 Elegível (Visita)'
-                elif row['Dias_com_Evento'] >= 2:
-                    return '🟡 Requer Análise'
-                else:
-                    return '🟢 Monitoramento'
-                    
-            df_final['Status'] = df_final.apply(definir_status, axis=1)
-            
-            # Inserção das Colunas de Visita
-            df_final = pd.merge(df_final, df_tratados, on='username', how='left')
-            df_final['visita_aberta'] = df_final['visita_aberta'].fillna('Não')
-            df_final['visita_realizada'] = df_final['visita_realizada'].fillna('Não')
-            df_final.rename(columns={'visita_aberta': 'Visita Aberta', 'visita_realizada': 'Visita Realizada'}, inplace=True)
-            
-            # Ordenação Final
-            df_final['Ordem_Status'] = df_final['Status'].map({'🔴 Elegível (Visita)': 1, '🟡 Requer Análise': 2, '🟢 Monitoramento': 3})
-            df_final['Peso_Alerta'] = df_final['🔥 Alerta Crítico'].map({'Sim': 1, 'Não': 2})
-            df_final = df_final.sort_values(by=['Ordem_Status', 'Peso_Alerta', 'Pico_Logs_Diario'], ascending=[True, True, False])
-            
-            if not df_final.empty:
-                with aba_relatorio:
-                    qtd_alerta = len(df_final[df_final['🔥 Alerta Crítico'] == 'Sim'])
-                    
-                    col_espaco1, col_card, col_espaco2 = st.columns([1, 2, 1])
-                    with col_card:
-                        st.metric("🔥 Clientes em Alerta Crítico", qtd_alerta)
-                    
-                    st.markdown("---")
-
-                    col_filtro, col_vazia = st.columns([3, 1])
-                    with col_filtro:
-                        filtro_exibicao = st.radio(
-                            "Filtro de visualização:", 
-                            ["🔥 Apenas Alertas Críticos", "🔴 Elegíveis", "🟡 Análise", "Todos os Status"],
-                            horizontal=True
-                        )
-                    
-                    if filtro_exibicao == "🔴 Elegíveis":
-                        df_exibicao = df_final[df_final['Status'] == '🔴 Elegível (Visita)']
-                    elif filtro_exibicao == "🔥 Apenas Alertas Críticos":
-                        df_exibicao = df_final[df_final['🔥 Alerta Crítico'] == 'Sim']
-                    elif filtro_exibicao == "🟡 Análise":
-                        df_exibicao = df_final[df_final['Status'] == '🟡 Requer Análise']
+                if 'username' in df.columns and 'c_username' in df.columns:
+                    match_data = re.search(r'\d{2}-\d{2}-\d{4}|\d{4}-\d{2}-\d{2}', arquivo.name)
+                    if match_data:
+                        data_str = match_data.group()
+                        try:
+                            if data_str.startswith('20'): 
+                                data_formatada = pd.to_datetime(data_str, format='%Y-%m-%d').date()
+                            else: 
+                                data_formatada = pd.to_datetime(data_str, format='%d-%m-%Y').date()
+                        except:
+                            data_formatada = None 
                     else:
-                        df_exibicao = df_final
+                        data_formatada = None
                     
-                    colunas_exibir = [
-                        'username', 'Status', '🔥 Alerta Crítico', 
-                        'Visita Aberta', 'Visita Realizada', 
-                        'Pico_Logs_Diario', 'Total_Desconexoes', 'Dias_com_Evento', 'Registros_Diários'
-                    ]
-                    
-                    st.dataframe(
-                        df_exibicao[colunas_exibir], 
-                        use_container_width=True,
-                        height=600,
-                        hide_index=True 
-                    )
+                    if data_formatada:
+                        df['Data_do_Log'] = data_formatada
+                        lista_dfs.append(df[['username', 'c_username', 'Data_do_Log']])
+            
+            if lista_dfs:
+                df_novos = pd.concat(lista_dfs, ignore_index=True)
+                salvar_no_banco(df_novos)
+                st.success("✅ Arquivos processados e consolidados no Banco de Dados!")
+        else:
+            st.warning("Nenhum arquivo selecionado.")
+            
+    st.markdown("---")
+    st.subheader("💾 Gerenciamento do Banco")
+    col_b1, col_b2 = st.columns(2)
+    with col_b1:
+        if os.path.exists(ARQUIVO_BANCO):
+            with open(ARQUIVO_BANCO, "rb") as file:
+                st.download_button(
+                    label="⬇️ Baixar Backup do Banco",
+                    data=file,
+                    file_name="banco_dados_radius_backup.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+    with col_b2:
+        if st.button("🗑️ Limpar Banco de Dados", use_container_width=True):
+            if os.path.exists(ARQUIVO_BANCO):
+                os.remove(ARQUIVO_BANCO)
+            st.success("Banco de dados zerado!")
+            st.rerun()
+
+# ==========================================
+# GERAÇÃO DO RELATÓRIO A PARTIR DO BANCO
+# ==========================================
+df_banco = carregar_banco()
+
+if not df_banco.empty:
+    # Filtra pela Data de Corte
+    df_bruto = df_banco[df_banco['Data_do_Log'] <= data_corte]
+    
+    # Exclui os PPPoEs ocultos
+    lista_ocultos_ativos = carregar_ocultos()
+    df_bruto = df_bruto[~df_bruto['username'].isin(lista_ocultos_ativos)]
+    
+    # df_bruto já vem agrupado do banco, apenas copiamos para a nomenclatura padrão
+    df_diario = df_bruto.copy()
+    
+    if df_diario.empty:
+        with aba_relatorio:
+            st.warning("⚠️ Não há dados a exibir após os filtros (ou não há logs até a data de corte).")
+    else:
+        df_resumo = df_diario.groupby('username').agg(
+            Total_Desconexoes=('c_username', 'sum'),
+            Dias_com_Evento=('Data_do_Log', 'nunique'),
+            Pico_Logs_Diario=('c_username', 'max') 
+        ).reset_index()
+
+        # Inteligência do Alerta Crítico
+        datas_janela = [(data_corte - timedelta(days=i)) for i in range(janela_dias)]
+        df_janela = df_diario[df_diario['Data_do_Log'].isin(datas_janela)]
+        
+        df_janela_critico = df_janela[df_janela['c_username'] >= logs_critico]
+        contagem_critica = df_janela_critico.groupby('username')['Data_do_Log'].nunique().reset_index()
+        contagem_critica.rename(columns={'Data_do_Log': 'Qtd_Dias_Alerta'}, inplace=True)
+
+        df_resumo = pd.merge(df_resumo, contagem_critica, on='username', how='left')
+        df_resumo['Qtd_Dias_Alerta'] = df_resumo['Qtd_Dias_Alerta'].fillna(0)
+        df_resumo['🔥 Alerta Crítico'] = df_resumo['Qtd_Dias_Alerta'].apply(lambda x: "Sim" if x >= dias_necessarios else "Não")
+        
+        # Matriz Rápida para Registros Diários
+        datas_exibicao = sorted(datas_janela) 
+        df_pivot = df_diario.pivot(index='username', columns='Data_do_Log', values='c_username').fillna(0)
+        
+        registros_list = []
+        for cliente in df_resumo['username']:
+            historico = []
+            if cliente in df_pivot.index:
+                for dia_alvo in datas_exibicao:
+                    qtd = int(df_pivot.at[cliente, dia_alvo]) if dia_alvo in df_pivot.columns else 0
+                    dia_str = dia_alvo.strftime("%d/%m")
+                    if qtd >= logs_critico:
+                        historico.append(f"{dia_str}: 🔴 {qtd}")
+                    else:
+                        historico.append(f"{dia_str}: 🟢 {qtd}")
+            registros_list.append(' | '.join(historico))
+            
+        df_resumo['Registros_Diários'] = registros_list
+        df_final = df_resumo.copy()
+        
+        # Definição do Status Base
+        def definir_status(row):
+            if row['Pico_Logs_Diario'] >= limite_elegivel:
+                return '🔴 Elegível (Visita)'
+            elif row['Dias_com_Evento'] >= 2:
+                return '🟡 Requer Análise'
             else:
-                with aba_relatorio:
-                    st.warning("Nenhum dado encontrado para a data de corte selecionada.")
+                return '🟢 Monitoramento'
+                
+        df_final['Status'] = df_final.apply(definir_status, axis=1)
+        
+        # Inserção das Colunas de Visita
+        df_final = pd.merge(df_final, df_tratados, on='username', how='left')
+        df_final['visita_aberta'] = df_final['visita_aberta'].fillna('Não')
+        df_final['visita_realizada'] = df_final['visita_realizada'].fillna('Não')
+        df_final.rename(columns={'visita_aberta': 'Visita Aberta', 'visita_realizada': 'Visita Realizada'}, inplace=True)
+        
+        # Ordenação Final
+        df_final['Ordem_Status'] = df_final['Status'].map({'🔴 Elegível (Visita)': 1, '🟡 Requer Análise': 2, '🟢 Monitoramento': 3})
+        df_final['Peso_Alerta'] = df_final['🔥 Alerta Crítico'].map({'Sim': 1, 'Não': 2})
+        df_final = df_final.sort_values(by=['Ordem_Status', 'Peso_Alerta', 'Pico_Logs_Diario'], ascending=[True, True, False])
+        
+        if not df_final.empty:
+            with aba_relatorio:
+                qtd_alerta = len(df_final[df_final['🔥 Alerta Crítico'] == 'Sim'])
+                
+                col_espaco1, col_card, col_espaco2 = st.columns([1, 2, 1])
+                with col_card:
+                    st.metric("🔥 Clientes em Alerta Crítico", qtd_alerta)
+                
+                st.markdown("---")
+
+                col_filtro, col_vazia = st.columns([3, 1])
+                with col_filtro:
+                    filtro_exibicao = st.radio(
+                        "Filtro de visualização:", 
+                        ["🔥 Apenas Alertas Críticos", "🔴 Elegíveis", "🟡 Análise", "Todos os Status"],
+                        horizontal=True
+                    )
+                
+                if filtro_exibicao == "🔴 Elegíveis":
+                    df_exibicao = df_final[df_final['Status'] == '🔴 Elegível (Visita)']
+                elif filtro_exibicao == "🔥 Apenas Alertas Críticos":
+                    df_exibicao = df_final[df_final['🔥 Alerta Crítico'] == 'Sim']
+                elif filtro_exibicao == "🟡 Análise":
+                    df_exibicao = df_final[df_final['Status'] == '🟡 Requer Análise']
+                else:
+                    df_exibicao = df_final
+                
+                colunas_exibir = [
+                    'username', 'Status', '🔥 Alerta Crítico', 
+                    'Visita Aberta', 'Visita Realizada', 
+                    'Pico_Logs_Diario', 'Total_Desconexoes', 'Dias_com_Evento', 'Registros_Diários'
+                ]
+                
+                st.dataframe(
+                    df_exibicao[colunas_exibir], 
+                    use_container_width=True,
+                    height=600,
+                    hide_index=True 
+                )
 else:
     with aba_relatorio:
-        st.info("👈 Faça o upload dos arquivos na aba 'Importar Dados' para gerar o relatório.")
+        st.info("👈 O Banco de Dados está vazio. Vá na aba 'Banco de Dados (Importar)' e envie os primeiros arquivos do RADIUS!")
